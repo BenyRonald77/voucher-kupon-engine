@@ -33,9 +33,13 @@ export async function POST(req: NextRequest) {
       throw new ApiError(403, "USER_DIBLOKIR", `User diblokir sementara sampai ${blokir.diblokirSampai}`);
     }
 
-    // 2. kode dikenal?
+    // 2. kode dikenal? (tetap dicatat untuk deteksi brute-force kode)
     const promo = await prisma.promo.findUnique({ where: { kode } });
-    if (!promo) throw new ApiError(404, "KODE_TIDAK_DIKENAL", `Kode ${kode} tidak dikenal`);
+    if (!promo) {
+      await catatPercobaan({ promoId: null, userId, kode, sukses: false, alasanGagal: "KODE_TIDAK_DIKENAL" });
+      await cekDanTandaiAbuse(userId, kode);
+      throw new ApiError(404, "KODE_TIDAK_DIKENAL", `Kode ${kode} tidak dikenal`);
+    }
 
     const gagal = async (e: ApiError) => {
       await catatPercobaan({ promoId: promo.id, userId, kode, sukses: false, alasanGagal: e.code });
@@ -81,7 +85,9 @@ export async function POST(req: NextRequest) {
         new ApiError(409, "BATAS_USER_TERLAMPAUI", `Batas pakai ${promo.batasPerUser}x per user terlampaui`)
       );
 
-    // 9. konsumsi kuota atomik: conditional update, cek baris terpengaruh
+    // 9. konsumsi kuota atomik: conditional update single-statement (tanpa
+    //    interactive transaction — Prisma+SQLite tidak tahan transaksi
+    //    konkurensi). Cek baris terpengaruh: 0 = kuota habis / promo nonaktif.
     const totalAwal = items.reduce((s, it) => s + Number(it.harga) * Number(it.qty), 0);
     let diskon =
       promo.tipeDiskon === "persen"
@@ -90,15 +96,28 @@ export async function POST(req: NextRequest) {
     diskon = Math.min(diskon, Math.round(totalAwal));
     const totalAkhir = Math.round(totalAwal) - diskon;
 
-    const redemption = await prisma.$transaction(async (tx) => {
-      const dipakaiUlang = await tx.redemption.count({ where: { promoId: promo.id, userId } });
-      if (dipakaiUlang >= promo.batasPerUser)
-        throw new ApiError(409, "BATAS_USER_TERLAMPAUI", `Batas pakai ${promo.batasPerUser}x per user terlampaui`);
-      const where: any = { id: promo.id, aktif: true };
-      if (promo.kuotaTotal !== null) where.terpakai = { lt: promo.kuotaTotal };
-      const upd = await tx.promo.updateMany({ where, data: { terpakai: { increment: 1 } } });
-      if (upd.count === 0) throw new ApiError(409, "KUOTA_HABIS", "Kuota promo habis");
-      return tx.redemption.create({
+    const kembalikanKuota = () =>
+      prisma.promo.updateMany({ where: { id: promo.id }, data: { terpakai: { decrement: 1 } } });
+
+    const whereKuota: any = { id: promo.id, aktif: true };
+    if (promo.kuotaTotal !== null) whereKuota.terpakai = { lt: promo.kuotaTotal };
+    const upd = await prisma.promo.updateMany({ where: whereKuota, data: { terpakai: { increment: 1 } } });
+    if (upd.count === 0)
+      await gagal(new ApiError(409, "KUOTA_HABIS", "Kuota promo habis"));
+
+    // cek ulang batas per user setelah kuota dikonsumsi (sempitkan window race
+    // antar request dari user yang sama); kembalikan kuota bila terlampaui
+    const dipakaiUlang = await prisma.redemption.count({ where: { promoId: promo.id, userId } });
+    if (dipakaiUlang >= promo.batasPerUser) {
+      await kembalikanKuota();
+      await gagal(
+        new ApiError(409, "BATAS_USER_TERLAMPAUI", `Batas pakai ${promo.batasPerUser}x per user terlampaui`)
+      );
+    }
+
+    let redemption;
+    try {
+      redemption = await prisma.redemption.create({
         data: {
           promoId: promo.id,
           userId,
@@ -108,7 +127,10 @@ export async function POST(req: NextRequest) {
           createdAt: nowIso(),
         },
       });
-    });
+    } catch (e) {
+      await kembalikanKuota();
+      throw e;
+    }
 
     await catatPercobaan({ promoId: promo.id, userId, kode, sukses: true });
 
