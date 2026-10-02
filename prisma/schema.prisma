@@ -1,0 +1,58 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Promo {
+  id             Int             @id @default(autoincrement())
+  kode           String          @unique
+  nama           String
+  tipeDiskon     String // "persen" | "nominal"
+  nilaiDiskon    Float
+  minBelanja     Float           @default(0)
+  kategori       String? // daftar kategori dipisah koma; null/kosong = semua
+  kuotaTotal     Int? // null = tanpa batas
+  batasPerUser   Int             @default(1)
+  mulaiBerlaku   String // YYYY-MM-DD
+  selesaiBerlaku String // YYYY-MM-DD
+  aktif          Boolean         @default(true)
+  terpakai       Int             @default(0)
+  createdAt      String // ISO
+  redemptions    Redemption[]
+  attempts       RedeemAttempt[]
+}
+
+model Redemption {
+  id         Int    @id @default(autoincrement())
+  promoId    Int
+  promo      Promo  @relation(fields: [promoId], references: [id])
+  userId     String
+  totalAwal  Float
+  diskon     Float
+  totalAkhir Float
+  createdAt  String // ISO
+}
+
+model RedeemAttempt {
+  id          Int     @id @default(autoincrement())
+  promoId     Int?
+  promo       Promo?  @relation(fields: [promoId], references: [id])
+  userId      String
+  kode        String
+  sukses      Boolean
+  alasanGagal String?
+  createdAt   String // ISO
+}
+
+model AbuseFlag {
+  id            Int     @id @default(autoincrement())
+  userId        String
+  alasan        String
+  diblokirSampai String? // ISO, null = blokir permanen (tidak dipakai di sini)
+  aktif         Boolean @default(true)
+  createdAt     String // ISO
+}
